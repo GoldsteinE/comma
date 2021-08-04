@@ -3,10 +3,29 @@
 mod syscall;
 use syscall::Syscall;
 
-use std::{convert::{TryInto as _, TryFrom as _},io, os::unix::process::CommandExt as _, process::Command};
+use std::{
+    collections::HashMap,
+    convert::{TryFrom as _, TryInto as _},
+    io,
+    os::unix::process::CommandExt as _,
+    process::Command,
+};
 
 use color_eyre::eyre::{self, bail, WrapErr as _};
-use nix::{libc::{PTRACE_EVENT_CLONE, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK}, sys::{ptrace, signal::Signal, wait::{WaitPidFlag, WaitStatus, waitpid}}, unistd::Pid};
+use nix::{errno::Errno, libc::{PTRACE_EVENT_CLONE, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK}, sys::{
+        ptrace,
+        signal::Signal,
+        wait::{waitpid, WaitStatus},
+    }, unistd::Pid};
+
+fn ptrace_options() -> ptrace::Options {
+    use ptrace::Options;
+
+    Options::PTRACE_O_TRACEFORK
+        | Options::PTRACE_O_TRACEVFORK
+        | Options::PTRACE_O_TRACECLONE
+        | Options::PTRACE_O_TRACESYSGOOD
+}
 
 fn main() -> eyre::Result<()> {
     color_eyre::install()?;
@@ -29,21 +48,34 @@ fn main() -> eyre::Result<()> {
         bail!("unexpected wait_pid result: {:?}", wait_res);
     }
 
-    ptrace::setoptions(pid, {
-        use ptrace::Options;
+    ptrace::setoptions(pid, ptrace_options())?;
 
-        Options::PTRACE_O_TRACEFORK
-            | Options::PTRACE_O_TRACEVFORK
-            | Options::PTRACE_O_TRACECLONE
-            | Options::PTRACE_O_TRACESYSGOOD
-    })?;
-
-    let mut syscall_start = true;
+    tracing::info!("Tracking pid {}", pid);
+    let mut syscall_start_map = HashMap::new();
+    syscall_start_map.insert(pid, true);
     let exit_code = loop {
-        ptrace::syscall(pid, None)?;
-        match waitpid(pid, Some(WaitPidFlag::WNOHANG))? {
-            WaitStatus::Exited(_, code) => break code,
-            WaitStatus::Signaled(_, sig, _) => break -(sig as i32),
+
+        for curr_pid in syscall_start_map.keys() {
+            match ptrace::syscall(*curr_pid, None) {
+                Ok(_) => {}
+                Err(Errno::ESRCH) => {}
+                Err(err) => {
+                    return Err(err.into())
+                }
+            }
+        }
+
+        match waitpid(None, None)? {
+            WaitStatus::Exited(exited_pid, code) => {
+                if pid == exited_pid {
+                    break code;
+                }
+            }
+            WaitStatus::Signaled(signaled_pid, sig, _) => {
+                if pid == signaled_pid {
+                    break -(sig as i32);
+                }
+            }
             WaitStatus::PtraceEvent(_, _, ev) => match ev {
                 PTRACE_EVENT_VFORK | PTRACE_EVENT_FORK | PTRACE_EVENT_CLONE => {
                     let child_pid = Pid::from_raw(
@@ -52,19 +84,28 @@ fn main() -> eyre::Result<()> {
                     if child_pid == pid {
                         tracing::info!("thread spawned");
                     } else {
-                        tracing::info!("process spawned with pid {}", pid);
+                        tracing::info!("process spawned with pid {}", child_pid);
+                        syscall_start_map.insert(child_pid, true);
+                        // ptrace::attach(child_pid)?;
                     }
                 }
                 other => {
                     tracing::info!("Unexpected event: {}", other);
                 }
             },
-            WaitStatus::PtraceSyscall(_) => {
-                let regs = ptrace::getregs(pid)?;
+            WaitStatus::PtraceSyscall(syscall_pid) => {
+                let syscall_start = syscall_start_map.get(&syscall_pid).copied().unwrap_or(true);
+
+                let regs = ptrace::getregs(syscall_pid)?;
                 if syscall_start {
-                    tracing::info!("Syscall: {:?}", Syscall::from_regs(pid, regs));
+                    tracing::info!(
+                        "[{}] Syscall: {:?}",
+                        syscall_pid,
+                        Syscall::from_regs(syscall_pid, regs)
+                    );
                 }
-                syscall_start ^= true;
+
+                syscall_start_map.insert(syscall_pid, !syscall_start);
             }
             WaitStatus::Stopped(_, _) => {}
             WaitStatus::Continued(_) => {}
