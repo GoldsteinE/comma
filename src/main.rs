@@ -12,11 +12,16 @@ use std::{
 };
 
 use color_eyre::eyre::{self, bail, WrapErr as _};
-use nix::{errno::Errno, libc::{PTRACE_EVENT_CLONE, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK}, sys::{
+use nix::{
+    errno::Errno,
+    libc::{PTRACE_EVENT_CLONE, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK},
+    sys::{
         ptrace,
         signal::Signal,
         wait::{waitpid, WaitStatus},
-    }, unistd::Pid};
+    },
+    unistd::Pid,
+};
 
 fn ptrace_options() -> ptrace::Options {
     use ptrace::Options;
@@ -54,14 +59,11 @@ fn main() -> eyre::Result<()> {
     let mut syscall_start_map = HashMap::new();
     syscall_start_map.insert(pid, true);
     let exit_code = loop {
-
         for curr_pid in syscall_start_map.keys() {
             match ptrace::syscall(*curr_pid, None) {
                 Ok(_) => {}
                 Err(Errno::ESRCH) => {}
-                Err(err) => {
-                    return Err(err.into())
-                }
+                Err(err) => return Err(err.into()),
             }
         }
 
