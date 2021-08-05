@@ -190,6 +190,15 @@ pub enum Syscall {
 }
 
 impl Syscall {
+    pub fn spawns_new_thread(&self) -> bool {
+        match self {
+            Self::Other(SyscallNr::clone) => true,
+            Self::Other(SyscallNr::fork) => true,
+            Self::Other(SyscallNr::vfork) => true,
+            _ => false,
+        }
+    }
+
     pub fn from_regs(pid: Pid, regs: user_regs_struct) -> Self {
         match Self::try_from_regs(pid, regs) {
             Ok(this) => this,
