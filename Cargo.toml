@@ -7,6 +7,7 @@ edition = "2018"
 
 [dependencies]
 color-eyre = "0.5.11"
+flume = "0.10.8"
 nix = "0.22.0"
 num_enum = "0.5.3"
 tracing = "0.1.26"

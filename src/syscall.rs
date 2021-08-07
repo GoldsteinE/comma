@@ -1,7 +1,7 @@
 use std::{
     convert::TryFrom as _,
     ffi::{c_void, OsString},
-    fs, mem,
+    fs,
     os::unix::ffi::OsStringExt as _,
     path::PathBuf,
 };
@@ -17,6 +17,33 @@ use nix::{
 #[allow(non_camel_case_types)]
 pub type c_umode_t = u16;
 
+// Assumed in the rest of the file
+const _ASSERT_C_LONG_IS_I64: [(); std::mem::size_of::<c_long>()] = [(); std::mem::size_of::<u64>()];
+const _ASSERT_USIZE_IS_U64: [(); std::mem::size_of::<usize>()] = [(); std::mem::size_of::<u64>()];
+
+#[derive(Debug, Clone, Copy)]
+pub struct OpenHow {
+    pub flags: u64,
+    pub mode: u64,
+    pub resolve: u64,
+}
+
+impl OpenHow {
+    fn read_from_process(pid: Pid, addr: u64) -> Result<Self, Errno> {
+        let addr = addr as usize;
+
+        let flags = ptrace::read(pid, addr as *mut c_void)? as u64;
+        let mode = ptrace::read(pid, (addr + 8) as *mut c_void)? as u64;
+        let resolve = ptrace::read(pid, (addr + 16) as *mut c_void)? as u64;
+
+        Ok(Self {
+            flags,
+            mode,
+            resolve,
+        })
+    }
+}
+
 fn read_string_from_process(pid: Pid, addr: u64) -> Result<Vec<u8>, Errno> {
     let mut result = Vec::new();
     let mut addr = addr as usize;
@@ -31,7 +58,7 @@ fn read_string_from_process(pid: Pid, addr: u64) -> Result<Vec<u8>, Errno> {
             result.push(byte)
         }
 
-        addr += mem::size_of::<c_long>();
+        addr += 8;
     }
 }
 
@@ -92,7 +119,7 @@ pub enum Syscall {
     OpenAt2 {
         dir: PathBuf,
         filename: PathBuf,
-        how: *const c_void,
+        how: OpenHow,
         size: isize,
     },
     Truncate {
@@ -190,20 +217,11 @@ pub enum Syscall {
 }
 
 impl Syscall {
-    pub fn spawns_new_thread(&self) -> bool {
-        match self {
-            Self::Other(SyscallNr::clone) => true,
-            Self::Other(SyscallNr::fork) => true,
-            Self::Other(SyscallNr::vfork) => true,
-            _ => false,
-        }
-    }
-
     pub fn from_regs(pid: Pid, regs: user_regs_struct) -> Self {
         match Self::try_from_regs(pid, regs) {
             Ok(this) => this,
             Err(err) => {
-                tracing::error!("failed to parse syscall args: {}", err);
+                tracing::warn!("failed to parse syscall args: {}", err);
                 // TODO: unneeded match
                 match SyscallNr::try_from(regs.orig_rax) {
                     Ok(nr) => Syscall::Other(nr),
@@ -233,7 +251,7 @@ impl Syscall {
             Ok(SyscallNr::openat2) => Self::OpenAt2 {
                 dir: pathbuf_from_fd(pid, regs.rdi)?,
                 filename: pathbuf_from_reg(pid, regs.rsi)?,
-                how: regs.rdx as usize as *const c_void,
+                how: OpenHow::read_from_process(pid, regs.rdx)?,
                 size: regs.r10 as isize,
             },
             Ok(SyscallNr::truncate) => {
