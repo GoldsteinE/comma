@@ -62,8 +62,9 @@ fn main() -> eyre::Result<()> {
     let mut advance_pid = pid;
 
     let exit_code = loop {
+        tracing::info!("Advancing {}", advance_pid);
         match ptrace::syscall(advance_pid, None) {
-            Ok(_) | Err(Errno::ESRCH) => {},
+            Ok(_) | Err(Errno::ESRCH) => {}
             Err(err) => return Err(err.into()),
         }
 
@@ -87,16 +88,6 @@ fn main() -> eyre::Result<()> {
                             i32::try_from(ptrace::getevent(parent_pid)?)
                                 .wrap_err("child pid is too big")?,
                         );
-
-                        // FIXME: not the best solution?
-                        loop {
-                            match ptrace::syscall(child_pid, None) {
-                                Ok(_) => break,
-                                Err(Errno::ESRCH) => {},
-                                Err(err) => return Err(err.into()),
-                            }
-                            std::thread::yield_now();
-                        }
 
                         tracing::info!(
                             "process {} spawned child with pid {}",
@@ -124,8 +115,13 @@ fn main() -> eyre::Result<()> {
 
                 syscall_start_map.insert(syscall_pid, !syscall_start);
             }
-            WaitStatus::Stopped(_, _) => {}
-            WaitStatus::Continued(_) => {}
+            WaitStatus::Stopped(pid, _) => {
+                tracing::info!("{} stopped", pid);
+                ptrace::syscall(pid, None)?;
+            }
+            WaitStatus::Continued(pid) => {
+                tracing::info!("{} continued", pid);
+            }
             WaitStatus::StillAlive => {}
         }
     };
