@@ -7,12 +7,7 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, WrapErr as _};
-use nix::{
-    errno::Errno,
-    libc::{c_int, c_long, c_uint, user_regs_struct},
-    sys::ptrace,
-    unistd::Pid,
-};
+use nix::{errno::Errno, libc::{FD_SETSIZE, c_int, c_long, c_uint, c_ulong, pid_t, user_regs_struct}, sys::{ptrace, select::FdSet}, unistd::Pid};
 
 #[allow(non_camel_case_types)]
 pub type c_umode_t = u16;
@@ -20,6 +15,9 @@ pub type c_umode_t = u16;
 // Assumed in the rest of the file
 const _ASSERT_C_LONG_IS_I64: [(); std::mem::size_of::<c_long>()] = [(); std::mem::size_of::<u64>()];
 const _ASSERT_USIZE_IS_U64: [(); std::mem::size_of::<usize>()] = [(); std::mem::size_of::<u64>()];
+// DEBUG
+const _ASSERT_FD_SET_CONSISTS_OF_LONGS: [(); std::mem::size_of::<FdSet>()] =
+    [(); FD_SETSIZE / std::mem::size_of::<c_long>()];
 
 #[derive(Debug, Clone, Copy)]
 pub struct OpenHow {
@@ -60,6 +58,37 @@ fn read_string_from_process(pid: Pid, addr: u64) -> Result<Vec<u8>, Errno> {
 
         addr += 8;
     }
+}
+
+#[derive(Clone)]
+#[repr(transparent)]
+pub struct DebuggableFdSet(FdSet);
+
+impl std::fmt::Debug for DebuggableFdSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_list();
+        for fd in self.0.clone().fds(None) {
+            d.entry(&fd);
+        }
+        d.finish()
+    }
+}
+
+// DEBUG
+pub fn read_fd_set_from_process(pid: Pid, addr: u64) -> Result<Option<DebuggableFdSet>, Errno> {
+    if addr == 0 {
+        return Ok(None);
+    }
+
+    let mut addr = addr as *const c_long;
+    let n: c_long = ptrace::read(pid, addr as _)?;
+    let mut buf = [c_long::default(); 1024 / 8 / core::mem::size_of::<c_long>()];
+    for i in 0..buf.len() {
+        let b = ptrace::read(pid, addr as _)? as u64;
+        buf[i] = b as i64;
+        addr = unsafe { addr.offset(1) };
+    }
+    unsafe { Ok(Some(std::mem::transmute(buf))) }
 }
 
 fn pathbuf_from_reg(pid: Pid, ptr: u64) -> Result<PathBuf> {
@@ -214,6 +243,32 @@ pub enum Syscall {
     },
     Other(SyscallNr),
     Unknown(u64),
+    // DEBUG
+    Wait4 {
+        pid: pid_t,
+        wstatus: usize,
+        options: c_int,
+        rusage: usize,
+    },
+    Select {
+        nfds: c_int,
+        readfds: Option<DebuggableFdSet>,
+        writefds: Option<DebuggableFdSet>,
+        exceptfds: Option<DebuggableFdSet>,
+        timeout: usize,
+    },
+    Clone {
+        clone_flags: c_ulong,
+        newsp: c_ulong,
+        parent_tidptr: usize,
+        child_tidptr: usize,
+        tls_val: c_int,
+    },
+    Read {
+        fd: c_uint,
+        buf: usize,
+        count: usize,
+    },
 }
 
 impl Syscall {
@@ -366,9 +421,37 @@ impl Syscall {
             Ok(SyscallNr::mknodat) => Self::MknodAt {
                 dir: pathbuf_from_fd(pid, regs.rdi)?,
                 path: pathbuf_from_reg(pid, regs.rsi)?,
-                mode: regs.rsi as c_umode_t,
-                dev: regs.rdx as c_uint,
+                mode: regs.rdx as c_umode_t,
+                dev: regs.r10 as c_uint,
             },
+
+            // DEBUG
+            Ok(SyscallNr::wait4) => Self::Wait4 {
+                pid: regs.rdi as pid_t,
+                wstatus: regs.rsi as usize,
+                options: regs.rdx as c_int,
+                rusage: regs.r10 as usize,
+            },
+            Ok(SyscallNr::select) => Self::Select {
+                nfds: regs.rdi as c_int,
+                readfds: read_fd_set_from_process(pid, regs.rsi)?,
+                writefds: read_fd_set_from_process(pid, regs.rdx)?,
+                exceptfds: read_fd_set_from_process(pid, regs.r10)?,
+                timeout: regs.r8 as usize,
+            },
+            Ok(SyscallNr::clone) => Self::Clone {
+                clone_flags: regs.rdi as c_ulong,
+                newsp: regs.rsi as c_ulong,
+                parent_tidptr: regs.rdx as usize,
+                child_tidptr: regs.r10 as usize,
+                tls_val: regs.r8 as c_int,
+            },
+            Ok(SyscallNr::read) => Self::Read {
+                fd: regs.rdi as c_uint,
+                buf: regs.rsi as usize,
+                count: regs.rdx as usize,
+            },
+
             Ok(nr) => Self::Other(nr),
             Err(_) => Self::Unknown(regs.orig_rax),
         })

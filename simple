@@ -1,5 +1,8 @@
 #!/bin/sh
 
-cd src/
-ls
-../threads
+cd foobar
+mkdir -p build
+cd build
+cmake -G Ninja ..
+cd ..
+rm -rf build
